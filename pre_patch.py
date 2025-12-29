@@ -472,7 +472,7 @@ def rasterize_contours_to_mask(
 
     for pts in contours_xyz:
         # Determine closest slice index by projection
-        proj = float(np.dot(pts[0], n))
+        proj = float(np.dot(pts.mean(axis=0), n))
         k = int(np.argmin(np.abs(slice_projs - proj)))
         if abs(slice_projs[k] - proj) > tol:
             # contour plane does not match any slice well; skip
@@ -483,6 +483,8 @@ def rasterize_contours_to_mask(
         v = pts - ipp[None, :]
         rows = np.dot(v, row_dir) / row_spacing
         cols = np.dot(v, col_dir) / col_spacing
+        # NOTE: DICOM IOP defines iop[:3] as the direction of +col and iop[3:] as +row.
+        # We therefore project to (row,col) using (row_dir=iop[3:], col_dir=iop[:3]).
 
         poly = [(float(c), float(r)) for r, c in zip(rows, cols)]
         # Rasterize with PIL on (X,Y) image where x=col, y=row
@@ -721,8 +723,11 @@ def resample_rtdose_to_ct_grid(
 
     # CT basis
     iop_c = ct_slices_sorted[0].image_orientation_patient
-    rc = np.array(iop_c[:3], dtype=np.float64)
-    cc = np.array(iop_c[3:], dtype=np.float64)
+    # DICOM IOP: iop[:3] points along +col, iop[3:] points along +row.
+    # Here we define directions corresponding to numpy indices:
+    #   yy (row_mm) multiplies row_dir_c, xx (col_mm) multiplies col_dir_c.
+    row_dir_c = np.array(iop_c[3:], dtype=np.float64)  # +row index
+    col_dir_c = np.array(iop_c[:3], dtype=np.float64)  # +col index
     # We'll use per-slice IPP for z positions (more robust than assuming constant spacing)
     syc = float(ct_meta.pixel_spacing_row_col[0])
     sxc = float(ct_meta.pixel_spacing_row_col[1])
@@ -732,12 +737,12 @@ def resample_rtdose_to_ct_grid(
     xx = (np.arange(Xc, dtype=np.float64) * sxc).reshape(1, Xc)  # (1,X)
 
     # Dot products between CT in-plane dirs and dose dirs
-    a_rr = float(np.dot(rc, rd))
-    a_cr = float(np.dot(cc, rd))
-    a_rc = float(np.dot(rc, cd))
-    a_cc = float(np.dot(cc, cd))
-    a_rn = float(np.dot(rc, nd))
-    a_cn = float(np.dot(cc, nd))
+    a_rr = float(np.dot(row_dir_c, rd))
+    a_cr = float(np.dot(col_dir_c, rd))
+    a_rc = float(np.dot(row_dir_c, cd))
+    a_cc = float(np.dot(col_dir_c, cd))
+    a_rn = float(np.dot(row_dir_c, nd))
+    a_cn = float(np.dot(col_dir_c, nd))
 
     out = np.zeros((Z, Yc, Xc), dtype=np.float32)
 

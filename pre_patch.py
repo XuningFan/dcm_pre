@@ -440,21 +440,40 @@ def rasterize_contours_to_mask(
     vol_shape_zyx: Tuple[int, int, int],
     fill_value: int = 1,
 ) -> np.ndarray:
-    """Rasterize 3D RTSTRUCT contours onto CT grid -> mask (Z,Y,X) uint8."""
-    from PIL import Image, ImageDraw
+    """
+    Rasterize 3D RTSTRUCT contours onto CT grid -> mask (Z,Y,X) uint8.
+
+    Implementation notes (important for alignment):
+    - DICOM ImagePositionPatient (IPP) is the *center* of pixel (0,0) for each slice.
+    - DICOM ImageOrientationPatient (IOP):
+        * iop[:3]  = direction cosines of image columns (+j)
+        * iop[3:]  = direction cosines of image rows    (+i)
+    - PixelSpacing = [row_spacing (i), col_spacing (j)]
+    - We compute continuous (i,j) in *pixel index* coordinates and then fill using skimage.draw.polygon
+      in (row=i, col=j) space.
+
+    This avoids the common half-pixel / axis-swap offsets that can occur with PIL ImageDraw.
+    """
+    try:
+        from skimage.draw import polygon as sk_polygon
+    except Exception as e:
+        raise RuntimeError(
+            "scikit-image is required for RTSTRUCT rasterization in this script. "
+            "Please install scikit-image (pip install scikit-image)."
+        ) from e
 
     Z, Y, X = vol_shape_zyx
     mask = np.zeros((Z, Y, X), dtype=np.uint8)
 
-    # Reference orientation & spacings
+    # Reference orientation & spacings (CT)
     iop = ct_slices_sorted[0].image_orientation_patient
-    row_dir = np.array(iop[:3], dtype=np.float64)
-    col_dir = np.array(iop[3:], dtype=np.float64)
+    col_dir = np.array(iop[:3], dtype=np.float64)  # +j
+    row_dir = np.array(iop[3:], dtype=np.float64)  # +i
     row_spacing = float(ct_slices_sorted[0].pixel_spacing[0])
     col_spacing = float(ct_slices_sorted[0].pixel_spacing[1])
     n = unit_normal_from_iop(iop)
 
-    # Slice projection positions
+    # Slice projection positions along normal
     slice_projs = []
     slice_ipps = []
     for s in ct_slices_sorted:
@@ -463,37 +482,38 @@ def rasterize_contours_to_mask(
         slice_projs.append(float(np.dot(ipp, n)))
     slice_projs = np.array(slice_projs, dtype=np.float64)
 
-    # Tolerance for assigning contour to slice
-    # Use median spacing as tolerance; fallback to thickness
+    # Tolerance for assigning contour to slice (half spacing, min 0.5mm)
     diffs = np.abs(np.diff(np.sort(slice_projs)))
     nonzero = diffs[diffs > 1e-6]
     tol = float(np.median(nonzero)) / 2.0 if len(nonzero) else float(ct_slices_sorted[0].slice_thickness or 3.0) / 2.0
-    tol = max(tol, 0.5)  # at least 0.5mm
+    tol = max(tol, 0.5)
 
     for pts in contours_xyz:
-        # Determine closest slice index by projection
+        if pts is None or len(pts) < 3:
+            continue
+
+        # Choose closest slice by projection of contour mean onto normal
         proj = float(np.dot(pts.mean(axis=0), n))
         k = int(np.argmin(np.abs(slice_projs - proj)))
         if abs(slice_projs[k] - proj) > tol:
-            # contour plane does not match any slice well; skip
             continue
 
         ipp = slice_ipps[k]
-        # Convert to (row, col) in pixel coordinates
-        v = pts - ipp[None, :]
-        rows = np.dot(v, row_dir) / row_spacing
-        cols = np.dot(v, col_dir) / col_spacing
-        # NOTE: DICOM IOP defines iop[:3] as the direction of +col and iop[3:] as +row.
-        # We therefore project to (row,col) using (row_dir=iop[3:], col_dir=iop[:3]).
+        v = pts - ipp[None, :]  # (N,3) mm relative to this slice origin
 
-        poly = [(float(c), float(r)) for r, c in zip(rows, cols)]
-        # Rasterize with PIL on (X,Y) image where x=col, y=row
-        img = Image.new("L", (X, Y), 0)
-        draw = ImageDraw.Draw(img)
-        draw.polygon(poly, outline=fill_value, fill=fill_value)
-        mask[k] |= (np.array(img, dtype=np.uint8) > 0).astype(np.uint8)
+        # Continuous pixel indices (i=row, j=col)
+        rr = np.dot(v, row_dir) / row_spacing
+        cc = np.dot(v, col_dir) / col_spacing
+
+        # Fill polygon on this slice.
+        # skimage.draw.polygon expects vertices in (r, c) with r=row (y), c=col (x).
+        pr, pc = sk_polygon(rr, cc, shape=(Y, X))
+        if pr.size == 0:
+            continue
+        mask[k, pr, pc] = fill_value
 
     return mask
+
 
 def generate_ptv_and_body_masks(
     dicom_dir: str,
@@ -690,6 +710,12 @@ def resample_rtdose_to_ct_grid(
     ct_meta: CTSeriesMeta,
     ct_slices_sorted: List[CTSliceInfo],
     out_shape_zyx: Tuple[int, int, int],
+    body_mask_zyx: Optional[np.ndarray] = None,
+    ct_center_offset_px: float = 0.0,
+    dose_row_offset_px: float = 0.0,
+    dose_col_offset_px: float = 0.0,
+    dose_auto_offset: bool = False,
+    dose_auto_offset_mode: str = 'int',
 ) -> np.ndarray:
     """
     Resample RTDOSE onto CT voxel centers using trilinear interpolation.
@@ -721,20 +747,27 @@ def resample_rtdose_to_ct_grid(
     offsets_sorted = offsets[order]
     dose_sorted = dose_kyx[order, :, :]
 
+    # Helper: frame index axis for interpolation
+    idx_axis = np.arange(len(offsets_sorted), dtype=np.float64)
+
     # CT basis
     iop_c = ct_slices_sorted[0].image_orientation_patient
-    # DICOM IOP: iop[:3] points along +col, iop[3:] points along +row.
-    # Here we define directions corresponding to numpy indices:
-    #   yy (row_mm) multiplies row_dir_c, xx (col_mm) multiplies col_dir_c.
-    row_dir_c = np.array(iop_c[3:], dtype=np.float64)  # +row index
-    col_dir_c = np.array(iop_c[:3], dtype=np.float64)  # +col index
+    # DICOM ImageOrientationPatient convention:
+    #   iop[:3]  = direction cosines of image ROWS (i index, axis=Y)
+    #   iop[3:]  = direction cosines of image COLS (j index, axis=X)
+    # This matches unit_normal_from_iop(row=iop[:3], col=iop[3:]).
+    row_dir_c = np.array(iop_c[:3], dtype=np.float64)   # +row (i) direction
+    col_dir_c = np.array(iop_c[3:], dtype=np.float64)   # +col (j) direction
     # We'll use per-slice IPP for z positions (more robust than assuming constant spacing)
     syc = float(ct_meta.pixel_spacing_row_col[0])
     sxc = float(ct_meta.pixel_spacing_row_col[1])
 
     # Precompute y/x grids once
-    yy = (np.arange(Yc, dtype=np.float64) * syc).reshape(Yc, 1)  # (Y,1)
-    xx = (np.arange(Xc, dtype=np.float64) * sxc).reshape(1, Xc)  # (1,X)
+    # CT sampling grid in mm. By default we sample at voxel centers (offset=0.0).
+    # If your vendor encodes RTDOSE IPP0 as a voxel-corner rather than center, setting ct_center_offset_px=0.5
+    # often removes a persistent ~0.5 pixel in-plane shift.
+    yy = ((np.arange(Yc, dtype=np.float64) + float(ct_center_offset_px)) * syc).reshape(Yc, 1)  # (Y,1)
+    xx = ((np.arange(Xc, dtype=np.float64) + float(ct_center_offset_px)) * sxc).reshape(1, Xc)  # (1,X)
 
     # Dot products between CT in-plane dirs and dose dirs
     a_rr = float(np.dot(row_dir_c, rd))
@@ -746,8 +779,134 @@ def resample_rtdose_to_ct_grid(
 
     out = np.zeros((Z, Yc, Xc), dtype=np.float32)
 
+    # --- Alignment debug (CT slice0, pixel(0,0)) ---
+    try:
+        ipp_c0 = np.array(ct_slices_sorted[0].image_position_patient, dtype=np.float64)
+        # world position of the CT sampling point (0,0) under ct_center_offset_px
+        P_test = ipp_c0 + row_dir_c * (float(ct_center_offset_px) * syc) + col_dir_c * (float(ct_center_offset_px) * sxc)
+        base_test = P_test - ipp0_d
+        b_r_idx = float(np.dot(base_test, rd)) / float(syd)
+        b_c_idx = float(np.dot(base_test, cd)) / float(sxd)
+        print('[ALIGN DEBUG] CT slice0 sample(0,0) -> dose indices (row,col):', b_r_idx, b_c_idx)
+        print('[ALIGN DEBUG] frac(row), frac(col):', b_r_idx - np.floor(b_r_idx), b_c_idx - np.floor(b_c_idx))
+        if dose_auto_offset:
+            # Two common conventions exist in the wild:
+            #  - 'int': treat IPP as voxel-center and snap to nearest integer index (target frac -> 0)
+            #  - 'half': treat IPP as voxel-corner and snap to nearest half-integer (target frac -> 0.5)
+            frac_r = b_r_idx - np.floor(b_r_idx)
+            frac_c = b_c_idx - np.floor(b_c_idx)
+
+            off_int_r  = - (b_r_idx - float(np.round(b_r_idx)))
+            off_int_c  = - (b_c_idx - float(np.round(b_c_idx)))
+            off_half_r = 0.5 - frac_r
+            off_half_c = 0.5 - frac_c
+
+            mode = (dose_auto_offset_mode or 'int').lower().strip()
+
+            def _eval_candidate(off_r: float, off_c: float, ct_center: float) -> float:
+                # Score candidate by how well high dose stays inside body (lower is better).
+                # Uses a coarse grid on a few slices to stay fast.
+                if body_mask_zyx is None:
+                    return 0.0  # can't score; caller will fall back to heuristic
+                Zc, Yc0, Xc0 = body_mask_zyx.shape
+                ys = np.arange(0, Yc0, 8, dtype=np.int32)
+                xs = np.arange(0, Xc0, 8, dtype=np.int32)
+                if len(ys) == 0 or len(xs) == 0:
+                    return 0.0
+                # pick up to 5 slices that have body
+                z_candidates = np.linspace(0, Zc - 1, num=min(5, Zc), dtype=np.int32)
+                outside_sum = 0.0
+                inside_sum = 0.0
+                outside_n = 0
+                inside_n = 0
+                # prepare sampling offsets for CT plane
+                yy_loc = ((ys.astype(np.float64) + ct_center) * syc).reshape(-1, 1)  # (Ny,1)
+                xx_loc = ((xs.astype(np.float64) + ct_center) * sxc).reshape(1, -1)  # (1,Nx)
+                for z in z_candidates:
+                    bm = body_mask_zyx[z][np.ix_(ys, xs)]
+                    if bm.size == 0:
+                        continue
+                    ipp_c = np.array(ct_slices_sorted[z].image_position_patient, dtype=np.float64)
+                    base = ipp_c - ipp0_d
+                    b_r = float(np.dot(base, rd))
+                    b_c = float(np.dot(base, cd))
+                    b_k = float(np.dot(base, nd))
+                    r_mm = b_r + a_rr * yy_loc + a_cr * xx_loc
+                    c_mm = b_c + a_rc * yy_loc + a_cc * xx_loc
+                    k_mm = b_k + a_rn * yy_loc + a_cn * xx_loc
+
+                    r_idx = (r_mm / float(syd)) + off_r
+                    c_idx = (c_mm / float(sxd)) + off_c
+                    k_idx = np.interp(k_mm, offsets_sorted, idx_axis, left=np.nan, right=np.nan)
+
+                    # sample dose on this slice grid (flatten then reshape)
+                    coords = np.vstack([k_idx.ravel(), r_idx.ravel(), c_idx.ravel()])
+                    vals = ndi.map_coordinates(dose_sorted, coords, order=1, mode='nearest').reshape(len(ys), len(xs))
+
+                    inside = vals[bm > 0]
+                    outside = vals[bm <= 0]
+                    if inside.size:
+                        inside_sum += float(np.mean(inside))
+                        inside_n += 1
+                    if outside.size:
+                        outside_sum += float(np.mean(outside))
+                        outside_n += 1
+                if inside_n == 0:
+                    return float('inf')
+                # ratio: outside / inside
+                inside_mean = inside_sum / inside_n
+                outside_mean = outside_sum / max(outside_n, 1)
+                return outside_mean / (inside_mean + 1e-6)
+
+            if mode == 'int':
+                dose_row_offset_px, dose_col_offset_px = off_int_r, off_int_c
+            elif mode == 'half':
+                dose_row_offset_px, dose_col_offset_px = off_half_r, off_half_c
+            elif mode == 'none':
+                dose_row_offset_px, dose_col_offset_px = 0.0, 0.0
+            elif mode == 'best':
+                # Compare int vs half (and also no-offset) using a coarse, body-aware score when possible.
+                cand = []
+                cand.append(('none', 0.0, 0.0))
+                cand.append(('int', off_int_r, off_int_c))
+                cand.append(('half', off_half_r, off_half_c))
+
+                if body_mask_zyx is not None:
+                    scored = []
+                    for name, orr, occ in cand:
+                        s = _eval_candidate(orr, occ, float(ct_center_offset_px))
+                        scored.append((s, name, orr, occ))
+                    scored.sort(key=lambda x: x[0])
+                    best_s, best_name, best_r, best_c = scored[0]
+                    dose_row_offset_px, dose_col_offset_px = best_r, best_c
+                    print('[ALIGN DEBUG] dose_auto_offset_mode=best picked:', best_name, ' score=', best_s,
+                          ' offsets(row,col)=', dose_row_offset_px, dose_col_offset_px)
+                else:
+                    # Heuristic: pick whichever is closer in L2 to zero (smaller magnitude) to avoid huge shifts.
+                    opts = [
+                        ('none', 0.0, 0.0),
+                        ('int', off_int_r, off_int_c),
+                        ('half', off_half_r, off_half_c),
+                    ]
+                    name, br, bc = min(opts, key=lambda t: (t[1]*t[1] + t[2]*t[2]))
+                    dose_row_offset_px, dose_col_offset_px = br, bc
+                    print('[ALIGN DEBUG] dose_auto_offset_mode=best (no body mask) picked:', name,
+                          ' offsets(row,col)=', dose_row_offset_px, dose_col_offset_px)
+            else:
+                dose_row_offset_px, dose_col_offset_px = off_int_r, off_int_c
+
+            print('[ALIGN DEBUG] dose_auto_offset enabled. mode=', mode, ' offsets(row,col):',
+                  dose_row_offset_px, dose_col_offset_px)
+        else:
+
+            if abs(dose_row_offset_px) > 1e-9 or abs(dose_col_offset_px) > 1e-9 or abs(ct_center_offset_px) > 1e-9:
+                print('[ALIGN DEBUG] Using ct_center_offset_px=', ct_center_offset_px,
+                      ' dose_row_offset_px=', dose_row_offset_px,
+                      ' dose_col_offset_px=', dose_col_offset_px)
+    except Exception as _e:
+        print('[ALIGN DEBUG] skipped:', _e)
+
     # Helper: map projection distance (mm along dose normal) -> continuous k index
-    idx_axis = np.arange(len(offsets_sorted), dtype=np.float64)
 
     for z in range(Z):
         ipp_c = np.array(ct_slices_sorted[z].image_position_patient, dtype=np.float64)
@@ -764,8 +923,8 @@ def resample_rtdose_to_ct_grid(
         n_mm = b_n + a_rn * yy + a_cn * xx   # (Y,X)
 
         # Convert to dose index space
-        r_idx = r_mm / float(syd)
-        c_idx = c_mm / float(sxd)
+        r_idx = (r_mm / float(syd)) + float(dose_row_offset_px)
+        c_idx = (c_mm / float(sxd)) + float(dose_col_offset_px)
 
         # Map n_mm to k index via 1D interpolation on offsets
         k_idx = np.interp(n_mm, offsets_sorted, idx_axis, left=np.nan, right=np.nan)
@@ -938,6 +1097,160 @@ def crop_outputs_to_body(out_dir: str,
     return notes
 
 
+
+# -----------------------------
+# QC Visualization (CT / masks / dose)
+# -----------------------------
+
+def _save_montage_png(vol2d_list, titles, out_path, cmap="gray", vmin=None, vmax=None):
+    """
+    Save a simple montage grid of 2D arrays.
+    vol2d_list: list of 2D arrays
+    titles: list of strings (same length)
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = len(vol2d_list)
+    if n == 0:
+        return
+    cols = int(math.ceil(math.sqrt(n)))
+    rows = int(math.ceil(n / cols))
+
+    fig = plt.figure(figsize=(3.2 * cols, 3.2 * rows), dpi=150)
+    for i, (im, title) in enumerate(zip(vol2d_list, titles), start=1):
+        ax = fig.add_subplot(rows, cols, i)
+        ax.imshow(im, cmap=cmap, vmin=vmin, vmax=vmax, origin='upper')
+        ax.set_title(title, fontsize=8)
+        ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _overlay_contours(ax, mask2d, color, lw=1.0, swap_ij: bool = False):
+    """
+    Draw mask contour on current axes.
+
+    swap_ij:
+      - False: mask2d is (Y,X) aligned with CT slice array.
+      - True : visualize mask2d transposed (useful only if you have legacy masks saved with swapped axes).
+    """
+    try:
+        m = mask2d
+        if swap_ij:
+            m = np.transpose(m)
+        ax.contour(m.astype(np.uint8), levels=[0.5], colors=[color], linewidths=lw)
+    except Exception:
+        pass
+
+
+def _make_qc_slices_indices(Z: int, num: int = 12) -> List[int]:
+    if Z <= 0:
+        return []
+    num = int(max(1, num))
+    if num == 1:
+        return [Z // 2]
+    return [int(round(x)) for x in np.linspace(0, Z - 1, num=num)]
+
+
+def export_qc_visualizations(
+    out_dir: str,
+    num_slices: int = 12,
+    ct_window: Tuple[int, int] = (-1000, 1000),
+    dose_clip_percentile: float = 99.5,
+    swap_ij: bool = False,
+) -> List[str]:
+    """
+    Generate quick QC PNGs:
+      - qc_ct_montage.png           : CT axial montage
+      - qc_masks_overlay.png        : CT + PTV/BODY contours
+      - qc_dose_overlay.png         : CT + dose heatmap (+PTV contour)
+    Returns list of notes.
+    """
+    notes: List[str] = []
+    out_dir = str(out_dir)
+    ct_path = os.path.join(out_dir, "ct_hu.npy")
+    if not os.path.exists(ct_path):
+        return ["QC skipped: ct_hu.npy not found."]
+
+    ct = np.load(ct_path).astype(np.float32)  # (Z,Y,X)
+    Z, Y, X = ct.shape
+    idxs = _make_qc_slices_indices(Z, num_slices)
+
+    body_path = os.path.join(out_dir, "body_mask.npy")
+    ptv_path = os.path.join(out_dir, "ptv_mask.npy")
+    dose_path = os.path.join(out_dir, "dose.npy")
+
+    body = np.load(body_path).astype(np.uint8) if os.path.exists(body_path) else None
+    ptv = np.load(ptv_path).astype(np.uint8) if os.path.exists(ptv_path) else None
+    dose = np.load(dose_path).astype(np.float32) if os.path.exists(dose_path) else None
+
+    # --- CT montage ---
+    ct_imgs = [ct[k] for k in idxs]
+    ct_titles = [f"z={k}" for k in idxs]
+    vmin, vmax = ct_window
+    _save_montage_png(ct_imgs, ct_titles, os.path.join(out_dir, "qc_ct_montage.png"),
+                      cmap="gray", vmin=float(vmin), vmax=float(vmax))
+    notes.append("Saved qc_ct_montage.png")
+
+    # --- Masks overlay (contours) ---
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    cols = int(math.ceil(math.sqrt(len(idxs))))
+    rows = int(math.ceil(len(idxs) / cols))
+    fig = plt.figure(figsize=(3.2 * cols, 3.2 * rows), dpi=150)
+
+    for i, k in enumerate(idxs, start=1):
+        ax = fig.add_subplot(rows, cols, i)
+        ax.imshow(ct[k], cmap="gray", vmin=float(vmin), vmax=float(vmax), origin='upper')
+        if body is not None and body.shape == ct.shape:
+            _overlay_contours(ax, body[k] > 0, color="lime", lw=0.9, swap_ij=swap_ij)
+        if ptv is not None and ptv.shape == ct.shape:
+            _overlay_contours(ax, ptv[k] > 0, color="red", lw=1.1, swap_ij=swap_ij)
+        ax.set_title(f"z={k}", fontsize=8)
+        ax.axis("off")
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "qc_masks_overlay.png"), bbox_inches="tight")
+    plt.close(fig)
+    notes.append("Saved qc_masks_overlay.png (BODY=green, PTV=red)")
+
+    # --- Dose overlay ---
+    if dose is not None and dose.shape == ct.shape:
+        # clip dose for visualization
+        dvals = dose
+        try:
+            clip = float(np.percentile(dvals[dvals > 0], dose_clip_percentile)) if np.any(dvals > 0) else float(np.max(dvals))
+        except Exception:
+            clip = float(np.max(dvals))
+        clip = max(clip, 1e-6)
+
+        fig = plt.figure(figsize=(3.2 * cols, 3.2 * rows), dpi=150)
+        for i, k in enumerate(idxs, start=1):
+            ax = fig.add_subplot(rows, cols, i)
+            ax.imshow(ct[k], cmap="gray", vmin=float(vmin), vmax=float(vmax), origin='upper')
+            dose2d = dose[k]
+            if swap_ij:
+                dose2d = np.transpose(dose2d)
+            ax.imshow(np.clip(dose2d, 0, clip), alpha=0.55, cmap="hot", vmin=0.0, vmax=clip, origin='upper')
+            if ptv is not None and ptv.shape == ct.shape:
+                _overlay_contours(ax, ptv[k] > 0, color="cyan", lw=1.1, swap_ij=swap_ij)
+            ax.set_title(f"z={k}", fontsize=8)
+            ax.axis("off")
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "qc_dose_overlay.png"), bbox_inches="tight")
+        plt.close(fig)
+        notes.append(f"Saved qc_dose_overlay.png (dose clipped at p{dose_clip_percentile}={clip:.3g})")
+    else:
+        notes.append("qc_dose_overlay.png skipped: dose.npy missing or shape mismatch.")
+
+    return notes
+
+
 # -----------------------------
 # Main pipeline
 # -----------------------------
@@ -1010,6 +1323,16 @@ def main():
     ap.add_argument("--dose_norm_mode", type=str, default="p99", choices=["none","dmax","p99","rx"], help="Dose normalization mode for saved dose.npy. Default: p99 (within body).")
     ap.add_argument("--rx_gy", type=float, default=None, help="Prescription dose in Gy (required if dose_norm_mode='rx').")
     ap.add_argument("--dose_norm_p99", type=float, default=99.0, help="Percentile for dose_norm_mode='p99'. Default: 99.")
+    ap.add_argument("--ct_center_offset_px", type=float, default=0.0,
+                    help="CT sampling center offset in pixels used when mapping CT points into RTDOSE space (0.0=center, 0.5=corner-comp). Default: 0.0")
+    ap.add_argument("--dose_row_offset_px", type=float, default=0.0,
+                    help="Additional offset (in RTDOSE row index pixels) applied during resampling. Default: 0.0")
+    ap.add_argument("--dose_col_offset_px", type=float, default=0.0,
+                    help="Additional offset (in RTDOSE col index pixels) applied during resampling. Default: 0.0")
+    ap.add_argument("--dose_auto_offset", action="store_true",
+                    help="Auto-compute RTDOSE in-plane offsets from CT slice0 sample(0,0) fractional index (debug). Overrides --dose_row_offset_px/--dose_col_offset_px when enabled.")
+    ap.add_argument("--dose_auto_offset_mode", type=str, default="best", choices=["none","int","half","best"],
+                    help="When --dose_auto_offset is set, choose offset convention: 'int' (snap to integer), 'half' (snap to half-integer), 'none' (no offset), or 'best' (evaluate and pick). Default: best")
     ap.add_argument("--zero_outside_body", action="store_true", help="Apply dose[body==0]=0 before normalization & saving (recommended).")
     ap.add_argument("--resample_target_spacing", type=str, default=None, help="Optional target spacing 'sz,sy,sx' in mm to resample CT/dose/masks after all generation. Example: 3.0,1.5,1.5")
 
@@ -1024,6 +1347,13 @@ def main():
     ap.add_argument("--body_dilate_iters", type=int, default=2, help="In BODY HU-fallback, dilation iterations after CC selection to restore body thickness.")
     ap.add_argument("--crop_to_body", action="store_true", help="After generating body_mask, crop ct_hu/dose/masks to body bbox (+margin).")
     ap.add_argument("--crop_margin_mm", type=float, default=10.0, help="Cropping margin in mm when --crop_to_body is set.")
+
+    # ---- QC visualization outputs ----
+    ap.add_argument("--qc_viz", action="store_true", help="Export QC PNGs (CT montage, mask overlay, dose overlay) into out_dir.")
+    ap.add_argument("--qc_num_slices", type=int, default=12, help="Number of axial slices in QC montages. Default: 12")
+    ap.add_argument("--qc_ct_window", type=str, default="-1000,1000", help="CT window for QC as 'vmin,vmax' in HU. Default: -1000,1000")
+    ap.add_argument("--qc_dose_clip_p", type=float, default=99.5, help="Percentile to clip dose for QC visualization. Default: 99.5")
+    ap.add_argument("--qc_swap_ij", action="store_true", help="(QC only) Swap i/j when visualizing masks & dose. Use ONLY for legacy saved masks.")
 
     args = ap.parse_args()
 
@@ -1095,12 +1425,31 @@ def main():
                 print("[WARN] No RTDOSE found. dose.npy will NOT be generated.")
             else:
                 dose_kyx, dose_info = load_rtdose_dicom(rtdose_path)
+
+                # Geometry logs for alignment debugging
+                try:
+                    print('[CT GEOM]')
+                    print('  IPP  (ImagePositionPatient):', slices_sorted[0].image_position_patient)
+                    print('  IOP  (ImageOrientationPatient):', slices_sorted[0].image_orientation_patient)
+                    print('  PixelSpacing (row,col):', slices_sorted[0].pixel_spacing)
+                    print('[RTDOSE GEOM]')
+                    print('  IPP0 (ImagePositionPatient):', dose_info.get('ipp0'))
+                    print('  IOP  (ImageOrientationPatient):', dose_info.get('iop'))
+                    print('  PixelSpacing (row,col):', dose_info.get('pixel_spacing_row_col'))
+                except Exception as _e:
+                    print('[GEOM LOG] skipped:', _e)
                 dose_ct = resample_rtdose_to_ct_grid(
                     dose_kyx=dose_kyx,
                     dose_info=dose_info,
                     ct_meta=meta,
                     ct_slices_sorted=slices_sorted,
                     out_shape_zyx=vol.shape,
+                    body_mask_zyx=body_mask,
+                    ct_center_offset_px=float(args.ct_center_offset_px),
+                    dose_row_offset_px=float(args.dose_row_offset_px),
+                    dose_col_offset_px=float(args.dose_col_offset_px),
+                    dose_auto_offset=bool(args.dose_auto_offset),
+                    dose_auto_offset_mode=str(args.dose_auto_offset_mode),
                 )
 
                 # Apply body outside zero (recommended)
@@ -1218,6 +1567,23 @@ def main():
             vol = np.load(os.path.join(args.out_dir, "ct_hu.npy"))
         except Exception:
             pass
+
+    
+    # ---- optional QC visualizations ----
+    if args.qc_viz:
+        try:
+            vmin_s, vmax_s = [float(x) for x in str(args.qc_ct_window).split(",")]
+        except Exception:
+            vmin_s, vmax_s = -1000.0, 1000.0
+        qc_notes = export_qc_visualizations(
+            out_dir=args.out_dir,
+            num_slices=int(args.qc_num_slices),
+            ct_window=(int(vmin_s), int(vmax_s)),
+            dose_clip_percentile=float(args.qc_dose_clip_p),
+            swap_ij=bool(args.qc_swap_ij),
+        )
+        for n in qc_notes:
+            print("[QC]", n)
 
     print("=== CT Read & Clean Done ===")
     print(f"SeriesInstanceUID: {meta.series_instance_uid}")
